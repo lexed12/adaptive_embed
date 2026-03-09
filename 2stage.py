@@ -1,641 +1,437 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageTk
 import numpy as np
-import math
+from PIL import Image
+import os
+import random
 
-class AdaptiveSteganography:
-    def __init__(self, image_path, message):
-        self.original_image = Image.open(image_path).convert('RGB')
-        self.image_array = np.array(self.original_image)
-        self.message = message
-        self.height, self.width = self.image_array.shape[:2]
+class SteganographyMultiLevel:
+    def __init__(self, block_size=32, num_blocks=5):
+        self.block_size = block_size
+        self.num_blocks = num_blocks
+        self.end_marker = [0, 0, 0, 0, 0, 0, 0, 0]  # 8 нулевых битов как маркер конца
         
-        # Параметры блоков
-        self.block_size = 8
-        self.blocks_y = self.height // self.block_size
-        self.blocks_x = self.width // self.block_size
+        # Расчет общей вместимости для всех уровней
+        self.pixels_per_block = block_size * block_size  # 1024
+        self.total_pixels = self.pixels_per_block * num_blocks  # 5120
+        self.total_channels = 3  # RGB
         
-        # Предвычисление энтропии для всех блоков
-        self.block_entropies = self._calculate_block_entropies()
-        
-        # Сортировка блоков по убыванию энтропии
-        self.sorted_blocks = self._sort_blocks_by_entropy()
-        
-        # Максимальная теоретическая емкость
-        self.max_capacity = self._calculate_max_capacity()
-        
-        # Генерация всех 25 уровней
-        self.stego_images = self._generate_stego_levels()
+        # Вместимость для каждого уровня битности
+        self.capacities = {}
+        for n_bits in range(1, 9):
+            total_bits = self.total_pixels * self.total_channels * n_bits
+            self.capacities[n_bits] = {
+                'total_bits': total_bits,
+                'total_bytes': total_bits // 8,
+                'total_chars': (total_bits // 8) - 1  # минус маркер конца
+            }
     
-    def _calculate_entropy(self, block):
-        hist, _ = np.histogram(block.flatten(), bins=256, range=(0, 256))
-        hist = hist[hist > 0]
-        probabilities = hist / np.sum(hist)
-        entropy = -np.sum(probabilities * np.log2(probabilities))
+    def calculate_entropy(self, block):
+        """Вычисление энтропии Шеннона для блока"""
+        flat_block = block.flatten()
+        hist = np.bincount(flat_block, minlength=256)
+        hist = hist[hist > 0] / len(flat_block)
+        entropy = -np.sum(hist * np.log2(hist))
         return entropy
     
-    def _calculate_block_entropies(self):
-        entropies = np.zeros((self.blocks_y, self.blocks_x))
+    def find_high_entropy_blocks(self, image_array):
+        """Поиск 5 блоков с максимальной энтропией"""
+        h, w = image_array.shape[:2]
+        block_entropies = []
         
-        for y in range(self.blocks_y):
-            for x in range(self.blocks_x):
-                y_start = y * self.block_size
-                y_end = (y + 1) * self.block_size
-                x_start = x * self.block_size
-                x_end = (x + 1) * self.block_size
+        # Перебираем все возможные блоки 32x32
+        for y in range(0, h - self.block_size + 1, self.block_size):
+            for x in range(0, w - self.block_size + 1, self.block_size):
+                block = image_array[y:y+self.block_size, x:x+self.block_size]
                 
-                block = self.image_array[y_start:y_end, x_start:x_end]
+                # Для цветного изображения усредняем энтропию по каналам
+                if len(image_array.shape) == 3:
+                    entropies = [self.calculate_entropy(block[:,:,c]) for c in range(3)]
+                    entropy = np.mean(entropies)
+                else:
+                    entropy = self.calculate_entropy(block)
                 
-                block_entropy = 0
-                for channel in range(3):
-                    channel_block = block[:, :, channel]
-                    block_entropy += self._calculate_entropy(channel_block)
-                
-                entropies[y, x] = block_entropy / 3
+                block_entropies.append(((x, y), entropy))
         
-        return entropies
-    
-    def _sort_blocks_by_entropy(self):
-        blocks = []
-        for y in range(self.blocks_y):
-            for x in range(self.blocks_x):
-                blocks.append({
-                    'y': y,
-                    'x': x,
-                    'entropy': self.block_entropies[y, x]
-                })
+        # Сортируем по убыванию энтропии и берем первые 5 блоков
+        block_entropies.sort(key=lambda x: x[1], reverse=True)
+        selected_blocks = [pos for pos, _ in block_entropies[:self.num_blocks]]
         
-        blocks.sort(key=lambda b: b['entropy'], reverse=True)
-        return blocks
-    
-    def _calculate_max_capacity(self):
-        total_blocks = self.blocks_y * self.blocks_x
-        bits_per_block = self.block_size * self.block_size * 3 * 8
-        max_bits = total_blocks * bits_per_block
-        return max_bits // 8
-    
-    def _get_channels_for_level(self, level_percent):
-        if level_percent < 0.33:
-            return [2]  # Только синий
-        elif level_percent < 0.66:
-            return [2, 0]  # Синий и красный
-        else:
-            return [0, 1, 2]  # Все каналы
-    
-    def _get_bits_per_channel(self, level_percent):
-        if level_percent < 0.125:
-            return 1
-        elif level_percent < 0.25:
-            return 2
-        elif level_percent < 0.375:
-            return 3
-        elif level_percent < 0.5:
-            return 4
-        elif level_percent < 0.625:
-            return 5
-        elif level_percent < 0.75:
-            return 6
-        elif level_percent < 0.875:
-            return 7
-        else:
-            return 8
-    
-    def _embed_message(self, level):
-        stego_array = self.image_array.copy()
+        print(f"Найдено 5 блоков 32x32 с максимальной энтропией:")
+        for i, (x, y) in enumerate(selected_blocks, 1):
+            print(f"  Блок {i}: ({x}, {y}), энтропия = {block_entropies[i-1][1]:.4f}")
         
-        # Количество блоков для встраивания пропорционально уровню
-        num_blocks = int(len(self.sorted_blocks) * level)
+        return selected_blocks
+    
+    def create_mask(self, image_shape, selected_blocks):
+        """Создание маски с отмеченными блоками - ВСЕ 5 блоков белые"""
+        mask = np.zeros(image_shape[:2], dtype=np.uint8)
         
-        # Определяем параметры встраивания
-        channels_to_use = self._get_channels_for_level(level)
-        bits_per_channel = self._get_bits_per_channel(level)
+        for x, y in selected_blocks:
+            mask[y:y+self.block_size, x:x+self.block_size] = 255
+            
+        return mask
+    
+    def text_to_bits(self, text):
+        """Преобразование текста в биты"""
+        bits = []
+        for char in text:
+            char_bits = format(ord(char), '08b')
+            bits.extend([int(b) for b in char_bits])
+        return bits
+    
+    def bits_to_text(self, bits):
+        """Преобразование битов обратно в текст"""
+        chars = []
+        for i in range(0, len(bits), 8):
+            if i + 8 <= len(bits):
+                byte = bits[i:i+8]
+                char_code = int(''.join(map(str, byte)), 2)
+                if 32 <= char_code <= 126:  # Только печатные символы
+                    chars.append(chr(char_code))
+        return ''.join(chars)
+    
+    def generate_random_bits(self, count):
+        """Генерация случайных битов для заполнения"""
+        return [random.randint(0, 1) for _ in range(count)]
+    
+    def embed_message_nbits_full(self, image_array, message, selected_blocks, n_bits):
+        """
+        ПОЛНОЕ заполнение всех 5 блоков информацией
+        Сообщение + случайные биты до полного заполнения
+        """
+        img_copy = image_array.copy()
+        
+        # Проверяем, что изображение цветное
+        if len(img_copy.shape) != 3 or img_copy.shape[2] != 3:
+            raise ValueError("Изображение должно быть цветным (RGB) с 3 каналами")
+        
+        # Получаем вместимость для данного уровня
+        capacity = self.capacities[n_bits]
+        total_bits_needed = capacity['total_bits']
         
         # Преобразуем сообщение в биты
-        message_bytes = self.message.encode('utf-8')
-        message_bits = ''.join(format(byte, '08b') for byte in message_bytes)
+        message_bits = self.text_to_bits(message)
         
-        # Рассчитываем необходимое количество бит
-        bits_per_pixel = len(channels_to_use) * bits_per_channel
-        total_bits_needed = num_blocks * self.block_size * self.block_size * bits_per_pixel
+        # Добавляем маркер конца
+        message_with_marker = message_bits + self.end_marker
+        message_len = len(message_with_marker)
         
-        # Дублируем сообщение при необходимости
-        if len(message_bits) < total_bits_needed:
-            repeats = total_bits_needed // len(message_bits) + 1
-            message_bits = (message_bits * repeats)[:total_bits_needed]
+        print(f"\n  ПОЛНОЕ ЗАПОЛНЕНИЕ с {n_bits} бит/пиксель:")
+        print(f"    Размер блока: {self.block_size}x{self.block_size} = {self.pixels_per_block} пикселей")
+        print(f"    Всего блоков: {self.num_blocks}")
+        print(f"    Всего пикселей: {self.total_pixels}")
+        print(f"    Каналов на пиксель: {self.total_channels}")
+        print(f"    ВСЕГО ДОСТУПНО БИТ: {total_bits_needed}")
+        print(f"    Максимум символов: {capacity['total_chars']}")
+        print(f"    Битов в сообщении: {len(message_bits)}")
+        print(f"    Битов с маркером: {message_len}")
         
+        # Генерируем случайные биты для заполнения оставшегося места
+        if message_len < total_bits_needed:
+            random_bits_needed = total_bits_needed - message_len
+            random_bits = self.generate_random_bits(random_bits_needed)
+            all_bits = message_with_marker + random_bits
+            print(f"    Добавлено случайных бит: {random_bits_needed}")
+        else:
+            all_bits = message_with_marker[:total_bits_needed]
+            print(f"    ВНИМАНИЕ: Сообщение обрезано до {total_bits_needed} бит")
+        
+        print(f"    ВСЕГО БИТ ДЛЯ ВСТРАИВАНИЯ: {len(all_bits)}")
+        
+        # Встраиваем биты последовательно во все пиксели всех блоков
         bit_index = 0
+        total_pixels_modified = 0
+        changes_log = []
         
-        # Встраивание в блоки с самой высокой энтропии
-        for block_info in self.sorted_blocks[:num_blocks]:
-            y = block_info['y']
-            x = block_info['x']
+        for block_idx, (block_x, block_y) in enumerate(selected_blocks):
+            print(f"    Блок {block_idx+1}: ({block_x}, {block_y})")
+            pixels_in_block = 0
             
-            y_start = y * self.block_size
-            y_end = (y + 1) * self.block_size
-            x_start = x * self.block_size
-            x_end = (x + 1) * self.block_size
+            for y in range(block_y, block_y + self.block_size):
+                for x in range(block_x, block_x + self.block_size):
+                    if bit_index >= len(all_bits):
+                        break
+                    
+                    # Для каждого пикселя изменяем n бит в каждом канале
+                    for c in range(3):  # R, G, B каналы
+                        if bit_index >= len(all_bits):
+                            break
+                        
+                        # Текущее значение пикселя
+                        current_value = img_copy[y, x, c]
+                        
+                        # Берем следующие n бит из all_bits
+                        bits_to_embed = 0
+                        for b in range(n_bits):
+                            if bit_index < len(all_bits):
+                                if all_bits[bit_index] == 1:
+                                    bits_to_embed |= (1 << b)
+                                bit_index += 1
+                        
+                        # Очищаем n младших бит и вставляем новые
+                        mask = (1 << n_bits) - 1
+                        new_value = (current_value & ~mask) | bits_to_embed
+                        
+                        # Логируем первые несколько изменений для отладки
+                        if len(changes_log) < 5:
+                            old_bits = current_value & mask
+                            changes_log.append(f"        ({x},{y},{c}): {current_value:3d} -> {new_value:3d} (биты: {bin(old_bits)[2:].zfill(n_bits)} -> {bin(bits_to_embed)[2:].zfill(n_bits)})")
+                        
+                        # Применяем изменения
+                        img_copy[y, x, c] = new_value
+                    
+                    pixels_in_block += 1
+                    total_pixels_modified += 1
+                    
+                if bit_index >= len(all_bits):
+                    break
             
-            for i in range(self.block_size):
-                for j in range(self.block_size):
-                    for channel in channels_to_use:
-                        if bit_index < len(message_bits):
-                            pixel_value = stego_array[y_start + i, x_start + j, channel]
+            print(f"      Изменено пикселей в блоке: {pixels_in_block}")
+        
+        # Выводим несколько примеров изменений
+        if changes_log:
+            print(f"    Примеры изменений (первые 5):")
+            for log in changes_log:
+                print(log)
+        
+        print(f"    ВСЕГО ИЗМЕНЕНО ПИКСЕЛЕЙ: {total_pixels_modified}")
+        print(f"    ВСЕГО ИСПОЛЬЗОВАНО БИТ: {bit_index}")
+        print(f"    Заполнение: {bit_index}/{total_bits_needed} бит ({bit_index/total_bits_needed*100:.1f}%)")
+        
+        return img_copy
+    
+    def extract_message_nbits_full(self, image_array, selected_blocks, n_bits):
+        """
+        Извлечение ВСЕХ битов из 5 блоков
+        """
+        capacity = self.capacities[n_bits]
+        total_bits_to_extract = capacity['total_bits']
+        extracted_bits = []
+        bits_extracted = 0
+        
+        print(f"\n  Извлечение ВСЕХ битов с {n_bits} бит/пиксель:")
+        print(f"    Всего бит для извлечения: {total_bits_to_extract}")
+        
+        for block_idx, (block_x, block_y) in enumerate(selected_blocks):
+            for y in range(block_y, block_y + self.block_size):
+                for x in range(block_x, block_x + self.block_size):
+                    for c in range(3):
+                        if bits_extracted >= total_bits_to_extract:
+                            break
                             
-                            bits_to_embed = message_bits[bit_index:bit_index + bits_per_channel]
-                            if len(bits_to_embed) == bits_per_channel:
-                                value_to_embed = int(bits_to_embed, 2)
-                                
-                                if bits_per_channel == 8:
-                                    stego_array[y_start + i, x_start + j, channel] = value_to_embed
-                                else:
-                                    mask = (0xFF << bits_per_channel) & 0xFF
-                                    stego_array[y_start + i, x_start + j, channel] = (pixel_value & mask) | value_to_embed
-                                
-                                bit_index += bits_per_channel
+                        # Извлекаем n бит из пикселя
+                        pixel_value = image_array[y, x, c]
+                        mask = (1 << n_bits) - 1
+                        pixel_bits = pixel_value & mask
+                        
+                        # Извлекаем каждый бит
+                        for b in range(n_bits):
+                            if bits_extracted >= total_bits_to_extract:
+                                break
+                            bit = (pixel_bits >> b) & 1
+                            extracted_bits.append(bit)
+                            bits_extracted += 1
+                    
+                    if bits_extracted >= total_bits_to_extract:
+                        break
+                if bits_extracted >= total_bits_to_extract:
+                    break
+            if bits_extracted >= total_bits_to_extract:
+                break
         
-        return Image.fromarray(stego_array.astype('uint8'))
-    
-    def _generate_stego_levels(self):
-        levels = 24
-        stego_images = []
+        print(f"    Извлечено бит: {bits_extracted}")
         
-        for i in range(levels + 1):
-            level = i / levels
-            print(f"Генерация уровня {i}/{levels}...")
-            stego_image = self._embed_message(level)
-            stego_images.append(stego_image)
-        
-        return stego_images
-    
-    def get_image_for_level(self, level_index):
-        return self.stego_images[level_index]
-    
-    def calculate_psnr(self, original, stego):
-        if original.size != stego.size:
-            stego = stego.resize(original.size, Image.Resampling.LANCZOS)
-        
-        original_array = np.array(original)
-        stego_array = np.array(stego)
-        
-        mse = np.mean((original_array - stego_array) ** 2)
-        if mse == 0:
-            return float('inf')
-        
-        max_pixel = 255.0
-        psnr = 20 * math.log10(max_pixel / math.sqrt(mse))
-        return psnr
-
-
-class ImageViewer(ttk.Frame):
-    """Виджет для отображения изображения с прокруткой в реальном масштабе"""
-    def __init__(self, parent, title):
-        super().__init__(parent)
-        
-        # Заголовок
-        title_label = ttk.Label(self, text=title, font=('Arial', 12, 'bold'))
-        title_label.pack(pady=5)
-        
-        # Создаем фрейм с прокруткой
-        canvas_frame = ttk.Frame(self)
-        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Canvas для отображения изображения
-        self.canvas = tk.Canvas(canvas_frame, bg='#2b2b2b', highlightthickness=1, 
-                                highlightbackground='#555')
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Полосы прокрутки
-        v_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview)
-        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        h_scrollbar = ttk.Scrollbar(self, orient=tk.HORIZONTAL, command=self.canvas.xview)
-        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
-        
-        # Настройка canvas
-        self.canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
-        
-        # Привязка событий для масштабирования колесиком мыши
-        self.canvas.bind('<MouseWheel>', self._on_mousewheel)
-        self.canvas.bind('<Control-MouseWheel>', self._on_ctrl_mousewheel)
-        
-        # Переменные для масштабирования
-        self.scale_factor = 1.0
-        self.image = None
-        self.image_tk = None
-        self.image_id = None
-        self.original_image = None
-        
-        # Информация о размере
-        self.info_label = ttk.Label(self, text="Размер: -", font=('Arial', 9))
-        self.info_label.pack(pady=2)
-    
-    def set_image(self, pil_image):
-        """Установка изображения для отображения"""
-        self.original_image = pil_image
-        self.original_size = pil_image.size
-        self.scale_factor = 1.0
-        self._update_display()
-        self.info_label.config(text=f"Размер: {self.original_size[0]}x{self.original_size[1]} пикселей")
-    
-    def _update_display(self):
-        """Обновление отображения с текущим масштабом"""
-        if self.original_image is None:
-            return
-        
-        # Масштабируем изображение
-        new_size = (int(self.original_size[0] * self.scale_factor),
-                   int(self.original_size[1] * self.scale_factor))
-        
-        if new_size[0] > 0 and new_size[1] > 0:
-            scaled_image = self.original_image.resize(new_size, Image.Resampling.NEAREST)
-            self.image_tk = ImageTk.PhotoImage(scaled_image)
-            
-            # Обновляем canvas
-            self.canvas.delete("all")
-            self.image_id = self.canvas.create_image(0, 0, image=self.image_tk, anchor=tk.NW)
-            
-            # Настраиваем область прокрутки
-            self.canvas.configure(scrollregion=(0, 0, new_size[0], new_size[1]))
-    
-    def _on_mousewheel(self, event):
-        """Обработка колесика мыши для вертикальной прокрутки"""
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-    
-    def _on_ctrl_mousewheel(self, event):
-        """Обработка Ctrl+колесико для масштабирования"""
-        if event.delta > 0:
-            self.scale_factor *= 1.1
+        # Ищем маркер конца, чтобы найти сообщение
+        message_bits = []
+        for i in range(len(extracted_bits) - 7):
+            if extracted_bits[i:i+8] == self.end_marker:
+                message_bits = extracted_bits[:i]
+                print(f"    Найден маркер конца на позиции {i}")
+                print(f"    Битов в сообщении: {len(message_bits)}")
+                break
         else:
-            self.scale_factor *= 0.9
+            message_bits = extracted_bits
+            print(f"    Маркер конца не найден, возвращаем все биты")
         
-        # Ограничиваем масштаб
-        self.scale_factor = max(0.1, min(5.0, self.scale_factor))
+        return message_bits, extracted_bits
+    
+    def process_all_levels_full(self, image_path, message, output_dir="stego_output"):
+        """
+        Создает 8 изображений с ПОЛНЫМ заполнением 5 блоков
+        """
+        os.makedirs(output_dir, exist_ok=True)
         
-        self._update_display()
+        # Загружаем изображение
+        img = Image.open(image_path).convert('RGB')
+        img_array = np.array(img)
         
-        # Обновляем информацию о масштабе
-        self.info_label.config(
-            text=f"Размер: {self.original_size[0]}x{self.original_size[1]} пикселей | Масштаб: {self.scale_factor:.1f}x"
-        )
+        print("=" * 90)
+        print("СТЕГАНОГРАФИЯ: ПОЛНОЕ ЗАПОЛНЕНИЕ 5 БЛОКОВ 32x32")
+        print("=" * 90)
+        print(f"Изображение: {image_path}")
+        print(f"Размер: {img_array.shape[1]}x{img_array.shape[0]}")
+        print(f"Сообщение: '{message}'")
+        print(f"Длина сообщения: {len(message)} символов = {len(message) * 8} бит")
+        print("-" * 90)
+        
+        # Находим 5 блоков с максимальной энтропией
+        selected_blocks = self.find_high_entropy_blocks(img_array)
+        
+        # Создаем маску (ВСЕ 5 блоков белые)
+        mask = self.create_mask(img_array.shape, selected_blocks)
+        mask_img = Image.fromarray(mask)
+        mask_path = os.path.join(output_dir, "mask.jpg")
+        mask_img.save(mask_path)
+        print(f"\nМаска сохранена: {mask_path}")
+        print("-" * 90)
+        
+        # Сохраняем оригинал для сравнения
+        original_path = os.path.join(output_dir, "original.jpg")
+        img.save(original_path)
+        
+        results = {}
+        
+        # Для каждого уровня битности (1-8)
+        for n_bits in range(1, 9):
+            print(f"\n{'='*70}")
+            print(f"УРОВЕНЬ {n_bits} БИТ НА ПИКСЕЛЬ - ПОЛНОЕ ЗАПОЛНЕНИЕ")
+            print(f"{'='*70}")
+            
+            try:
+                capacity = self.capacities[n_bits]
+                print(f"Вместимость: {capacity['total_chars']} символов, {capacity['total_bits']} бит")
+                
+                # Встраиваем сообщение с ПОЛНЫМ заполнением
+                embedded_array = self.embed_message_nbits_full(
+                    img_array.copy(), message, selected_blocks, n_bits
+                )
+                
+                # Сохраняем изображение
+                output_filename = f"embedded_{n_bits}bits_full.jpg"
+                output_path = os.path.join(output_dir, output_filename)
+                
+                embedded_img = Image.fromarray(embedded_array)
+                embedded_img.save(output_path)
+                
+                # Извлекаем ВСЕ биты для проверки
+                extracted_message_bits, all_extracted_bits = self.extract_message_nbits_full(
+                    embedded_array, selected_blocks, n_bits
+                )
+                extracted_message = self.bits_to_text(extracted_message_bits)
+                
+                # Подсчитываем изменения
+                changes = 0
+                for bx, by in selected_blocks:
+                    for y in range(by, by + self.block_size):
+                        for x in range(bx, bx + self.block_size):
+                            if not np.array_equal(img_array[y, x], embedded_array[y, x]):
+                                changes += 1
+                
+                results[n_bits] = {
+                    'path': output_path,
+                    'extracted': extracted_message,
+                    'correct': extracted_message == message,
+                    'changed_pixels': changes,
+                    'total_pixels': self.total_pixels,
+                    'total_bits': capacity['total_bits'],
+                    'extracted_bits_count': len(all_extracted_bits)
+                }
+                
+                print(f"\n  РЕЗУЛЬТАТ:")
+                print(f"  Сохранено: {output_path}")
+                print(f"  Изменено пикселей: {changes} из {self.total_pixels}")
+                print(f"  Изменено в %: {changes/self.total_pixels*100:.1f}%")
+                print(f"  Извлечено бит всего: {len(all_extracted_bits)}")
+                print(f"  Извлечено сообщение: '{extracted_message}'")
+                print(f"  Корректно: {extracted_message == message}")
+                
+            except Exception as e:
+                print(f"  ОШИБКА: {e}")
+                results[n_bits] = {'error': str(e)}
+        
+        # Сохраняем отчет
+        self.save_report_full(results, message, selected_blocks, output_dir)
+        
+        return results, selected_blocks, mask
+    
+    def save_report_full(self, results, original_message, selected_blocks, output_dir):
+        """Сохранение подробного отчета о ПОЛНОМ заполнении"""
+        report_path = os.path.join(output_dir, "report_full.txt")
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 90 + "\n")
+            f.write("ОТЧЕТ О ПОЛНОМ ЗАПОЛНЕНИИ 5 БЛОКОВ 32x32\n")
+            f.write("=" * 90 + "\n\n")
+            
+            f.write(f"Исходное сообщение: '{original_message}'\n")
+            f.write(f"Длина: {len(original_message)} символов = {len(original_message) * 8} бит\n\n")
+            
+            f.write("Блоки 32x32:\n")
+            for i, (x, y) in enumerate(selected_blocks, 1):
+                f.write(f"  Блок {i}: ({x}, {y})\n")
+            
+            f.write(f"\nВсего пикселей в 5 блоках: {self.total_pixels}\n")
+            f.write(f"Всего каналов (RGB): {self.total_pixels * 3}\n\n")
+            
+            f.write("РЕЗУЛЬТАТЫ ПО УРОВНЯМ (ПОЛНОЕ ЗАПОЛНЕНИЕ):\n")
+            f.write("-" * 90 + "\n")
+            
+            for n_bits in range(1, 9):
+                f.write(f"\n[{n_bits} БИТ НА ПИКСЕЛЬ]\n")
+                
+                if n_bits in results:
+                    if 'error' in results[n_bits]:
+                        f.write(f"  Статус: ОШИБКА - {results[n_bits]['error']}\n")
+                    else:
+                        cap = self.capacities[n_bits]
+                        f.write(f"  Вместимость: {cap['total_chars']} символов, {cap['total_bits']} бит\n")
+                        f.write(f"  Фактически встроено бит: {cap['total_bits']} (ПОЛНОЕ ЗАПОЛНЕНИЕ)\n")
+                        f.write(f"  Изменено пикселей: {results[n_bits]['changed_pixels']} из {self.total_pixels}\n")
+                        f.write(f"  Изменено в %: {results[n_bits]['changed_pixels']/self.total_pixels*100:.1f}%\n")
+                        f.write(f"  Извлечено бит при проверке: {results[n_bits]['extracted_bits_count']}\n")
+                        f.write(f"  Извлечено сообщение: '{results[n_bits]['extracted']}'\n")
+                        f.write(f"  Корректность: {results[n_bits]['correct']}\n")
+                else:
+                    f.write(f"  Нет данных\n")
+        
+        print(f"\nПодробный отчет сохранен: {report_path}")
 
+def demonstrate_full_fill():
+    """Демонстрация ПОЛНОГО заполнения всех 5 блоков"""
+    
+    # Создаем экземпляр класса
+    stego = SteganographyMultiLevel(block_size=32, num_blocks=5)
+    
+    # Тестовое сообщение
+    message = "Secret Message"
+    
+    # Путь к изображению
+    input_image = "container.jpg"  # Замените на ваш файл
+    
+    try:
+        # Запускаем обработку с ПОЛНЫМ заполнением
+        results, blocks, mask = stego.process_all_levels_full(
+            image_path=input_image,
+            message=message,
+            output_dir="stego_full_fill"
+        )
+        
+        # Итоговая статистика
+        print("\n" + "=" * 90)
+        print("ИТОГОВАЯ СТАТИСТИКА ПОЛНОГО ЗАПОЛНЕНИЯ")
+        print("=" * 90)
+        
+        for n_bits in range(1, 9):
+            if n_bits in results and 'error' not in results[n_bits]:
+                cap = stego.capacities[n_bits]
+                print(f"\n{n_bits} бит/пиксель:")
+                print(f"  Вместимость: {cap['total_chars']} символов")
+                print(f"  Встроено бит: {cap['total_bits']} ({cap['total_bits']/8} байт)")
+                print(f"  Изменено пикселей: {results[n_bits]['changed_pixels']}")
+                print(f"  Сообщение извлечено: '{results[n_bits]['extracted']}'")
+                print(f"  Корректно: {results[n_bits]['correct']}")
+        
+    except Exception as e:
+        print(f"Ошибка: {e}")
 
-class SteganographyGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Адаптивная стеганография на основе энтропии")
-        self.root.geometry("1200x800")
-        
-        self.stego_system = None
-        self.current_level = 0
-        
-        self.setup_ui()
-    
-    def setup_ui(self):
-        # Создаем вкладки
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Вкладка 1: Оригинальное изображение
-        self.original_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.original_tab, text="Оригинал")
-        self.setup_original_tab()
-        
-        # Вкладка 2: Стего-изображение с ползунком
-        self.stego_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.stego_tab, text="Стего-изображение")
-        self.setup_stego_tab()
-        
-        # Вкладка 3: Информация и статистика
-        self.info_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.info_tab, text="Информация")
-        self.setup_info_tab()
-        
-        # Нижняя панель с общими элементами управления
-        self.setup_control_panel()
-    
-    def setup_original_tab(self):
-        """Вкладка с оригинальным изображением"""
-        # Кнопка загрузки
-        btn_frame = ttk.Frame(self.original_tab)
-        btn_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        self.load_btn = ttk.Button(btn_frame, text="Загрузить изображение", 
-                                   command=self.load_image)
-        self.load_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.file_label = ttk.Label(btn_frame, text="Файл не выбран")
-        self.file_label.pack(side=tk.LEFT, padx=10)
-        
-        # Просмотрщик оригинального изображения
-        self.original_viewer = ImageViewer(self.original_tab, "Оригинальное изображение")
-        self.original_viewer.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-    
-    def setup_stego_tab(self):
-        """Вкладка со стего-изображением и ползунком"""
-        # Верхняя панель с ползунком
-        slider_frame = ttk.LabelFrame(self.stego_tab, text="Уровень встраивания", padding=10)
-        slider_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Ползунок
-        slider_controls = ttk.Frame(slider_frame)
-        slider_controls.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(slider_controls, text="Меньше").pack(side=tk.LEFT, padx=5)
-        
-        self.level_var = tk.DoubleVar(value=0)
-        self.level_slider = ttk.Scale(
-            slider_controls,
-            from_=0, to=24,
-            orient=tk.HORIZONTAL,
-            variable=self.level_var,
-            command=self.on_slider_changed,
-            state='disabled'
-        )
-        self.level_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
-        
-        ttk.Label(slider_controls, text="Больше").pack(side=tk.LEFT, padx=5)
-        
-        # Метка с текущим уровнем
-        self.level_label = ttk.Label(slider_frame, text="Уровень: 0/24", font=('Arial', 10, 'bold'))
-        self.level_label.pack(pady=5)
-        
-        # Индикатор этапов
-        stages_frame = ttk.Frame(slider_frame)
-        stages_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(stages_frame, text="[Синий]", foreground='blue').pack(side=tk.LEFT, expand=True)
-        ttk.Label(stages_frame, text="[Синий+Красный]", foreground='purple').pack(side=tk.LEFT, expand=True)
-        ttk.Label(stages_frame, text="[Все каналы]", foreground='black').pack(side=tk.LEFT, expand=True)
-        
-        # Детальная информация
-        self.detail_label = ttk.Label(slider_frame, text="", font=('Arial', 9))
-        self.detail_label.pack(pady=2)
-        
-        # Просмотрщик стего-изображения
-        self.stego_viewer = ImageViewer(self.stego_tab, "Стего-изображение")
-        self.stego_viewer.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-    
-    def setup_info_tab(self):
-        """Вкладка с информацией и статистикой"""
-        # Основная информация
-        info_frame = ttk.LabelFrame(self.info_tab, text="Общая информация", padding=10)
-        info_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        self.info_text = tk.Text(info_frame, height=8, width=60, wrap=tk.WORD, font=('Arial', 10))
-        self.info_text.pack(fill=tk.X, padx=5, pady=5)
-        self.info_text.insert(tk.END, "Загрузите изображение для начала работы...")
-        self.info_text.config(state=tk.DISABLED)
-        
-        # Статистика
-        stats_frame = ttk.LabelFrame(self.info_tab, text="Статистика качества", padding=10)
-        stats_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        stats_grid = ttk.Frame(stats_frame)
-        stats_grid.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(stats_grid, text="Емкость:", font=('Arial', 10)).grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
-        self.capacity_value = ttk.Label(stats_grid, text="-- байт", font=('Arial', 10, 'bold'))
-        self.capacity_value.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        ttk.Label(stats_grid, text="PSNR:", font=('Arial', 10)).grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
-        self.psnr_value = ttk.Label(stats_grid, text="-- dB", font=('Arial', 10, 'bold'))
-        self.psnr_value.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        ttk.Label(stats_grid, text="Размер изображения:", font=('Arial', 10)).grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
-        self.size_value = ttk.Label(stats_grid, text="--", font=('Arial', 10))
-        self.size_value.grid(row=2, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        ttk.Label(stats_grid, text="Блоков 8x8:", font=('Arial', 10)).grid(row=3, column=0, sticky=tk.W, padx=5, pady=2)
-        self.blocks_value = ttk.Label(stats_grid, text="--", font=('Arial', 10))
-        self.blocks_value.grid(row=3, column=1, sticky=tk.W, padx=5, pady=2)
-        
-        # Кнопка сохранения
-        save_frame = ttk.Frame(self.info_tab)
-        save_frame.pack(fill=tk.X, padx=5, pady=10)
-        
-        self.save_btn = ttk.Button(save_frame, text="Сохранить текущее стего-изображение", 
-                                   command=self.save_image, state='disabled')
-        self.save_btn.pack(side=tk.LEFT, padx=5)
-    
-    def setup_control_panel(self):
-        """Нижняя панель с сообщением и обработкой"""
-        control_panel = ttk.Frame(self.root)
-        control_panel.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Поле для сообщения
-        ttk.Label(control_panel, text="Сообщение:").pack(side=tk.LEFT, padx=5)
-        
-        self.message_entry = ttk.Entry(control_panel, width=40)
-        self.message_entry.insert(0, "Secret Message")
-        self.message_entry.pack(side=tk.LEFT, padx=5)
-        
-        # Кнопка обработки
-        self.process_btn = ttk.Button(control_panel, text="Обработать изображение", 
-                                      command=self.process_image, state='disabled')
-        self.process_btn.pack(side=tk.LEFT, padx=20)
-    
-    def load_image(self):
-        """Загрузка изображения"""
-        file_path = filedialog.askopenfilename(
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.gif")]
-        )
-        
-        if file_path:
-            self.image_path = file_path
-            self.file_label.config(text=f"Файл: {file_path.split('/')[-1]}")
-            
-            # Загружаем и отображаем оригинал
-            self.original_image = Image.open(file_path).convert('RGB')
-            self.original_viewer.set_image(self.original_image)
-            
-            # Обновляем информацию
-            self.update_info_text("Изображение загружено. Введите сообщение и нажмите 'Обработать'.")
-            
-            # Активируем кнопку обработки
-            self.process_btn.config(state='normal')
-    
-    def process_image(self):
-        """Обработка изображения - создание стегосистемы"""
-        if not hasattr(self, 'image_path'):
-            messagebox.showwarning("Предупреждение", "Сначала выберите изображение!")
-            return
-        
-        message = self.message_entry.get()
-        if not message:
-            messagebox.showwarning("Предупреждение", "Введите сообщение!")
-            return
-        
-        try:
-            self.root.config(cursor="watch")
-            self.root.update()
-            
-            # Создаем систему стеганографии
-            self.stego_system = AdaptiveSteganography(self.image_path, message)
-            
-            # Активируем элементы управления
-            self.level_slider.config(state='normal')
-            self.save_btn.config(state='normal')
-            
-            # Обновляем статистику
-            self.update_statistics()
-            
-            # Отображаем начальный уровень
-            self.on_slider_changed(0)
-            
-            # Переключаемся на вкладку со стего-изображением
-            self.notebook.select(1)
-            
-            self.update_info_text(
-                f"Изображение успешно обработано!\n"
-                f"Размер: {self.stego_system.width}x{self.stego_system.height}\n"
-                f"Блоков 8x8: {self.stego_system.blocks_x * self.stego_system.blocks_y}\n"
-                f"Максимальная емкость: {self.stego_system.max_capacity} байт\n\n"
-                f"Алгоритм:\n"
-                f"• Блоки сортируются по энтропии (от высокой к низкой)\n"
-                f"• Встраивание начинается с высокоэнтропийных блоков\n"
-                f"• На низких уровнях используются только сложные текстуры\n"
-                f"• На высоких уровнях используются даже гладкие области"
-            )
-            
-        except Exception as e:
-            messagebox.showerror("Ошибка", str(e))
-        finally:
-            self.root.config(cursor="")
-    
-    def on_slider_changed(self, value):
-        """Обработка изменения ползунка"""
-        if not self.stego_system:
-            return
-        
-        level = int(float(value))
-        self.level_var.set(level)
-        self.current_level = level
-        
-        # Определяем параметры для текущего уровня
-        level_percent = level / 24
-        
-        # Каналы
-        if level < 8:
-            channels_text = "Синий"
-            channel_color = "blue"
-            stage_text = "Этап 1: только высокоэнтропийные блоки"
-        elif level < 16:
-            channels_text = "Синий+Красный"
-            channel_color = "purple"
-            stage_text = "Этап 2: среднеэнтропийные блоки"
-        else:
-            channels_text = "Все каналы"
-            channel_color = "black"
-            stage_text = "Этап 3: низкоэнтропийные блоки"
-        
-        # Количество бит
-        if level_percent < 0.125:
-            bits = 1
-        elif level_percent < 0.25:
-            bits = 2
-        elif level_percent < 0.375:
-            bits = 3
-        elif level_percent < 0.5:
-            bits = 4
-        elif level_percent < 0.625:
-            bits = 5
-        elif level_percent < 0.75:
-            bits = 6
-        elif level_percent < 0.875:
-            bits = 7
-        else:
-            bits = 8
-        
-        # Процент используемых блоков
-        blocks_percent = int(level / 24 * 100)
-        
-        # Обновляем метки
-        self.level_label.config(
-            text=f"Уровень: {level}/24 | {stage_text}",
-            foreground=channel_color
-        )
-        
-        self.detail_label.config(
-            text=f"Каналы: {channels_text} | Бит на канал: {bits} | Использовано блоков: {blocks_percent}%"
-        )
-        
-        # Получаем и отображаем стего-изображение
-        stego_image = self.stego_system.get_image_for_level(level)
-        self.stego_viewer.set_image(stego_image)
-        
-        # Обновляем PSNR
-        psnr = self.stego_system.calculate_psnr(self.original_image, stego_image)
-        self.psnr_value.config(text=f"{psnr:.2f} dB")
-        
-        # Обновляем информацию о качестве
-        if psnr > 40:
-            quality = "Отличное качество"
-            quality_color = "green"
-        elif psnr > 30:
-            quality = "Хорошее качество"
-            quality_color = "blue"
-        elif psnr > 20:
-            quality = "Среднее качество"
-            quality_color = "orange"
-        else:
-            quality = "Плохое качество"
-            quality_color = "red"
-        
-        # Обновляем информационный текст
-        self.update_info_text(
-            f"Текущий уровень: {level}/24\n"
-            f"PSNR: {psnr:.2f} dB - {quality}\n"
-            f"Используемые каналы: {channels_text}\n"
-            f"Бит на канал: {bits}\n"
-            f"Блоков с изменениями: {blocks_percent}%\n"
-            f"Стадия: {stage_text}"
-        )
-    
-    def update_statistics(self):
-        """Обновление статистики на вкладке информации"""
-        if self.stego_system:
-            self.capacity_value.config(text=f"{self.stego_system.max_capacity} байт")
-            self.size_value.config(text=f"{self.stego_system.width}x{self.stego_system.height}")
-            self.blocks_value.config(text=f"{self.stego_system.blocks_x * self.stego_system.blocks_y}")
-    
-    def update_info_text(self, text):
-        """Обновление текстовой информации"""
-        self.info_text.config(state=tk.NORMAL)
-        self.info_text.delete(1.0, tk.END)
-        self.info_text.insert(tk.END, text)
-        self.info_text.config(state=tk.DISABLED)
-    
-    def save_image(self):
-        """Сохранение текущего стего-изображения"""
-        if not self.stego_system:
-            return
-        
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG files", "*.png"), ("JPEG files", "*.jpg"), ("All files", "*.*")]
-        )
-        
-        if file_path:
-            stego_image = self.stego_system.get_image_for_level(self.current_level)
-            stego_image.save(file_path)
-            messagebox.showinfo("Успех", f"Изображение сохранено:\n{file_path}")
-
-
-def main():
-    root = tk.Tk()
-    app = SteganographyGUI(root)
-    
-    # Центрируем окно
-    root.update_idletasks()
-    width = root.winfo_width()
-    height = root.winfo_height()
-    x = (root.winfo_screenwidth() // 2) - (width // 2)
-    y = (root.winfo_screenheight() // 2) - (height // 2)
-    root.geometry(f'{width}x{height}+{x}+{y}')
-    
-    root.mainloop()
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    demonstrate_full_fill()
