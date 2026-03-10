@@ -3,27 +3,16 @@ from PIL import Image
 import os
 import random
 
-class SteganographyMultiLevel:
+class SteganographyRandomBlock:
     def __init__(self, block_size=32, num_blocks=5):
         self.block_size = block_size
         self.num_blocks = num_blocks
         self.end_marker = [0, 0, 0, 0, 0, 0, 0, 0]  # 8 нулевых битов как маркер конца
         
-        # Расчет общей вместимости для всех уровней
+        # Расчет вместимости для одного блока
         self.pixels_per_block = block_size * block_size  # 1024
-        self.total_pixels = self.pixels_per_block * num_blocks  # 5120
         self.total_channels = 3  # RGB
         
-        # Вместимость для каждого уровня битности
-        self.capacities = {}
-        for n_bits in range(1, 9):
-            total_bits = self.total_pixels * self.total_channels * n_bits
-            self.capacities[n_bits] = {
-                'total_bits': total_bits,
-                'total_bytes': total_bits // 8,
-                'total_chars': (total_bits // 8) - 1  # минус маркер конца
-            }
-    
     def calculate_entropy(self, block):
         """Вычисление энтропии Шеннона для блока"""
         flat_block = block.flatten()
@@ -42,7 +31,6 @@ class SteganographyMultiLevel:
             for x in range(0, w - self.block_size + 1, self.block_size):
                 block = image_array[y:y+self.block_size, x:x+self.block_size]
                 
-                # Для цветного изображения усредняем энтропию по каналам
                 if len(image_array.shape) == 3:
                     entropies = [self.calculate_entropy(block[:,:,c]) for c in range(3)]
                     entropy = np.mean(entropies)
@@ -61,14 +49,24 @@ class SteganographyMultiLevel:
         
         return selected_blocks
     
-    def create_mask(self, image_shape, selected_blocks):
-        """Создание маски с отмеченными блоками - ВСЕ 5 блоков белые"""
-        mask = np.zeros(image_shape[:2], dtype=np.uint8)
+    def create_masks(self, image_shape, all_blocks, real_block):
+        """
+        Создание двух масок:
+        - mask_all: все 5 блоков белые
+        - mask_real: только реальный блок с информацией белый
+        """
+        mask_all = np.zeros(image_shape[:2], dtype=np.uint8)
+        mask_real = np.zeros(image_shape[:2], dtype=np.uint8)
         
-        for x, y in selected_blocks:
-            mask[y:y+self.block_size, x:x+self.block_size] = 255
-            
-        return mask
+        # Маска со всеми блоками
+        for x, y in all_blocks:
+            mask_all[y:y+self.block_size, x:x+self.block_size] = 255
+        
+        # Маска только с реальным блоком
+        x, y = real_block
+        mask_real[y:y+self.block_size, x:x+self.block_size] = 255
+        
+        return mask_all, mask_real
     
     def text_to_bits(self, text):
         """Преобразование текста в биты"""
@@ -85,179 +83,174 @@ class SteganographyMultiLevel:
             if i + 8 <= len(bits):
                 byte = bits[i:i+8]
                 char_code = int(''.join(map(str, byte)), 2)
-                if 32 <= char_code <= 126:  # Только печатные символы
+                if 32 <= char_code <= 126:
                     chars.append(chr(char_code))
         return ''.join(chars)
     
+    def calculate_block_capacity(self, n_bits):
+        """Расчет вместимости одного блока для заданного количества бит"""
+        total_bits = self.pixels_per_block * self.total_channels * n_bits
+        return {
+            'total_bits': total_bits,
+            'total_bytes': total_bits // 8,
+            'total_chars': (total_bits // 8) - 1  # минус маркер конца
+        }
+    
     def generate_random_bits(self, count):
-        """Генерация случайных битов для заполнения"""
+        """Генерация случайных битов"""
         return [random.randint(0, 1) for _ in range(count)]
     
-    def embed_message_nbits_full(self, image_array, message, selected_blocks, n_bits):
+    def embed_in_single_block(self, image_array, message, block_coords, n_bits, fill_entire_block=True):
         """
-        ПОЛНОЕ заполнение всех 5 блоков информацией
-        Сообщение + случайные биты до полного заполнения
+        Встраивание сообщения в ОДИН конкретный блок
         """
         img_copy = image_array.copy()
+        x, y = block_coords
         
-        # Проверяем, что изображение цветное
-        if len(img_copy.shape) != 3 or img_copy.shape[2] != 3:
-            raise ValueError("Изображение должно быть цветным (RGB) с 3 каналами")
-        
-        # Получаем вместимость для данного уровня
-        capacity = self.capacities[n_bits]
-        total_bits_needed = capacity['total_bits']
+        # Получаем вместимость блока
+        capacity = self.calculate_block_capacity(n_bits)
+        total_bits_in_block = capacity['total_bits']
         
         # Преобразуем сообщение в биты
         message_bits = self.text_to_bits(message)
-        
-        # Добавляем маркер конца
         message_with_marker = message_bits + self.end_marker
         message_len = len(message_with_marker)
         
-        print(f"\n  ПОЛНОЕ ЗАПОЛНЕНИЕ с {n_bits} бит/пиксель:")
+        print(f"\n  Встраивание в блок ({x}, {y}):")
         print(f"    Размер блока: {self.block_size}x{self.block_size} = {self.pixels_per_block} пикселей")
-        print(f"    Всего блоков: {self.num_blocks}")
-        print(f"    Всего пикселей: {self.total_pixels}")
         print(f"    Каналов на пиксель: {self.total_channels}")
-        print(f"    ВСЕГО ДОСТУПНО БИТ: {total_bits_needed}")
-        print(f"    Максимум символов: {capacity['total_chars']}")
-        print(f"    Битов в сообщении: {len(message_bits)}")
-        print(f"    Битов с маркером: {message_len}")
+        print(f"    Вместимость блока при {n_bits} бит/пиксель: {total_bits_in_block} бит")
+        print(f"    Битов в сообщении с маркером: {message_len}")
         
-        # Генерируем случайные биты для заполнения оставшегося места
-        if message_len < total_bits_needed:
-            random_bits_needed = total_bits_needed - message_len
-            random_bits = self.generate_random_bits(random_bits_needed)
-            all_bits = message_with_marker + random_bits
-            print(f"    Добавлено случайных бит: {random_bits_needed}")
+        if fill_entire_block:
+            # ПОЛНОЕ заполнение блока
+            if message_len < total_bits_in_block:
+                random_bits_needed = total_bits_in_block - message_len
+                random_bits = self.generate_random_bits(random_bits_needed)
+                all_bits = message_with_marker + random_bits
+                print(f"    Добавлено случайных бит: {random_bits_needed}")
+            else:
+                all_bits = message_with_marker[:total_bits_in_block]
+                print(f"    ВНИМАНИЕ: Сообщение обрезано до {total_bits_in_block} бит")
         else:
-            all_bits = message_with_marker[:total_bits_needed]
-            print(f"    ВНИМАНИЕ: Сообщение обрезано до {total_bits_needed} бит")
+            # Встраиваем только сообщение (без заполнения)
+            if message_len > total_bits_in_block:
+                raise ValueError(f"Сообщение слишком длинное для блока!")
+            all_bits = message_with_marker
+            print(f"    Встраивание без заполнения: {message_len} бит")
         
         print(f"    ВСЕГО БИТ ДЛЯ ВСТРАИВАНИЯ: {len(all_bits)}")
         
-        # Встраиваем биты последовательно во все пиксели всех блоков
+        # Встраиваем биты в блок
         bit_index = 0
-        total_pixels_modified = 0
+        pixels_modified = 0
         changes_log = []
         
-        for block_idx, (block_x, block_y) in enumerate(selected_blocks):
-            print(f"    Блок {block_idx+1}: ({block_x}, {block_y})")
-            pixels_in_block = 0
-            
-            for y in range(block_y, block_y + self.block_size):
-                for x in range(block_x, block_x + self.block_size):
+        for by in range(y, y + self.block_size):
+            for bx in range(x, x + self.block_size):
+                if bit_index >= len(all_bits):
+                    break
+                
+                # Для каждого пикселя изменяем n бит в каждом канале
+                for c in range(3):
                     if bit_index >= len(all_bits):
                         break
                     
-                    # Для каждого пикселя изменяем n бит в каждом канале
-                    for c in range(3):  # R, G, B каналы
-                        if bit_index >= len(all_bits):
-                            break
-                        
-                        # Текущее значение пикселя
-                        current_value = img_copy[y, x, c]
-                        
-                        # Берем следующие n бит из all_bits
-                        bits_to_embed = 0
-                        for b in range(n_bits):
-                            if bit_index < len(all_bits):
-                                if all_bits[bit_index] == 1:
-                                    bits_to_embed |= (1 << b)
-                                bit_index += 1
-                        
-                        # Очищаем n младших бит и вставляем новые
-                        mask = (1 << n_bits) - 1
-                        new_value = (current_value & ~mask) | bits_to_embed
-                        
-                        # Логируем первые несколько изменений для отладки
-                        if len(changes_log) < 5:
-                            old_bits = current_value & mask
-                            changes_log.append(f"        ({x},{y},{c}): {current_value:3d} -> {new_value:3d} (биты: {bin(old_bits)[2:].zfill(n_bits)} -> {bin(bits_to_embed)[2:].zfill(n_bits)})")
-                        
-                        # Применяем изменения
-                        img_copy[y, x, c] = new_value
+                    current_value = img_copy[by, bx, c]
                     
-                    pixels_in_block += 1
-                    total_pixels_modified += 1
+                    # Берем следующие n бит
+                    bits_to_embed = 0
+                    for b in range(n_bits):
+                        if bit_index < len(all_bits):
+                            if all_bits[bit_index] == 1:
+                                bits_to_embed |= (1 << b)
+                            bit_index += 1
                     
-                if bit_index >= len(all_bits):
-                    break
-            
-            print(f"      Изменено пикселей в блоке: {pixels_in_block}")
+                    # Очищаем n младших бит и вставляем новые
+                    mask = (1 << n_bits) - 1
+                    new_value = (current_value & ~mask) | bits_to_embed
+                    
+                    # Логируем первые несколько изменений
+                    if len(changes_log) < 5:
+                        old_bits = current_value & mask
+                        changes_log.append(f"        ({bx},{by},{c}): {current_value:3d} -> {new_value:3d} (биты: {bin(old_bits)[2:].zfill(n_bits)} -> {bin(bits_to_embed)[2:].zfill(n_bits)})")
+                    
+                    img_copy[by, bx, c] = new_value
+                
+                pixels_modified += 1
+                
+            if bit_index >= len(all_bits):
+                break
         
-        # Выводим несколько примеров изменений
+        # Выводим примеры изменений
         if changes_log:
             print(f"    Примеры изменений (первые 5):")
             for log in changes_log:
                 print(log)
         
-        print(f"    ВСЕГО ИЗМЕНЕНО ПИКСЕЛЕЙ: {total_pixels_modified}")
-        print(f"    ВСЕГО ИСПОЛЬЗОВАНО БИТ: {bit_index}")
-        print(f"    Заполнение: {bit_index}/{total_bits_needed} бит ({bit_index/total_bits_needed*100:.1f}%)")
+        print(f"    Изменено пикселей в блоке: {pixels_modified}")
+        print(f"    Использовано бит: {bit_index}")
         
         return img_copy
     
-    def extract_message_nbits_full(self, image_array, selected_blocks, n_bits):
+    def extract_from_single_block(self, image_array, block_coords, n_bits, extract_full_block=True):
         """
-        Извлечение ВСЕХ битов из 5 блоков
+        Извлечение из ОДНОГО конкретного блока
         """
-        capacity = self.capacities[n_bits]
-        total_bits_to_extract = capacity['total_bits']
+        x, y = block_coords
+        
+        if extract_full_block:
+            capacity = self.calculate_block_capacity(n_bits)
+            total_bits_to_extract = capacity['total_bits']
+            print(f"    Извлечение ВСЕХ битов из блока: {total_bits_to_extract} бит")
+        else:
+            total_bits_to_extract = self.pixels_per_block * self.total_channels * n_bits
+            print(f"    Извлечение до маркера конца")
+        
         extracted_bits = []
         bits_extracted = 0
         
-        print(f"\n  Извлечение ВСЕХ битов с {n_bits} бит/пиксель:")
-        print(f"    Всего бит для извлечения: {total_bits_to_extract}")
-        
-        for block_idx, (block_x, block_y) in enumerate(selected_blocks):
-            for y in range(block_y, block_y + self.block_size):
-                for x in range(block_x, block_x + self.block_size):
-                    for c in range(3):
-                        if bits_extracted >= total_bits_to_extract:
-                            break
-                            
-                        # Извлекаем n бит из пикселя
-                        pixel_value = image_array[y, x, c]
-                        mask = (1 << n_bits) - 1
-                        pixel_bits = pixel_value & mask
-                        
-                        # Извлекаем каждый бит
-                        for b in range(n_bits):
-                            if bits_extracted >= total_bits_to_extract:
-                                break
-                            bit = (pixel_bits >> b) & 1
-                            extracted_bits.append(bit)
-                            bits_extracted += 1
-                    
-                    if bits_extracted >= total_bits_to_extract:
+        for by in range(y, y + self.block_size):
+            for bx in range(x, x + self.block_size):
+                for c in range(3):
+                    if extract_full_block and bits_extracted >= total_bits_to_extract:
                         break
-                if bits_extracted >= total_bits_to_extract:
+                    
+                    pixel_value = image_array[by, bx, c]
+                    mask = (1 << n_bits) - 1
+                    pixel_bits = pixel_value & mask
+                    
+                    for b in range(n_bits):
+                        if extract_full_block and bits_extracted >= total_bits_to_extract:
+                            break
+                        bit = (pixel_bits >> b) & 1
+                        extracted_bits.append(bit)
+                        bits_extracted += 1
+                
+                if extract_full_block and bits_extracted >= total_bits_to_extract:
                     break
-            if bits_extracted >= total_bits_to_extract:
+            if extract_full_block and bits_extracted >= total_bits_to_extract:
                 break
         
-        print(f"    Извлечено бит: {bits_extracted}")
+        if not extract_full_block:
+            # Ищем маркер конца
+            for i in range(len(extracted_bits) - 7):
+                if extracted_bits[i:i+8] == self.end_marker:
+                    return extracted_bits[:i], extracted_bits
         
-        # Ищем маркер конца, чтобы найти сообщение
-        message_bits = []
-        for i in range(len(extracted_bits) - 7):
-            if extracted_bits[i:i+8] == self.end_marker:
-                message_bits = extracted_bits[:i]
-                print(f"    Найден маркер конца на позиции {i}")
-                print(f"    Битов в сообщении: {len(message_bits)}")
-                break
-        else:
-            message_bits = extracted_bits
-            print(f"    Маркер конца не найден, возвращаем все биты")
-        
-        return message_bits, extracted_bits
+        return extracted_bits, extracted_bits
     
-    def process_all_levels_full(self, image_path, message, output_dir="stego_output"):
+    def process_random_block(self, image_path, message, output_dir="stego_random", 
+                            fill_entire_block=True, seed=None):
         """
-        Создает 8 изображений с ПОЛНЫМ заполнением 5 блоков
+        Выбирает случайный блок из 5 и встраивает в него сообщение
+        Сохраняет ДВЕ маски:
+        - mask_all.jpg: все 5 блоков белые
+        - mask_real.jpg: только реальный блок с информацией
         """
+        if seed is not None:
+            random.seed(seed)
+        
         os.makedirs(output_dir, exist_ok=True)
         
         # Загружаем изображение
@@ -265,7 +258,7 @@ class SteganographyMultiLevel:
         img_array = np.array(img)
         
         print("=" * 90)
-        print("СТЕГАНОГРАФИЯ: ПОЛНОЕ ЗАПОЛНЕНИЕ 5 БЛОКОВ 32x32")
+        print("СТЕГАНОГРАФИЯ: СЛУЧАЙНЫЙ БЛОК ИЗ 5 (ДВЕ МАСКИ)")
         print("=" * 90)
         print(f"Изображение: {image_path}")
         print(f"Размер: {img_array.shape[1]}x{img_array.shape[0]}")
@@ -274,74 +267,108 @@ class SteganographyMultiLevel:
         print("-" * 90)
         
         # Находим 5 блоков с максимальной энтропией
-        selected_blocks = self.find_high_entropy_blocks(img_array)
+        all_blocks = self.find_high_entropy_blocks(img_array)
         
-        # Создаем маску (ВСЕ 5 блоков белые)
-        mask = self.create_mask(img_array.shape, selected_blocks)
-        mask_img = Image.fromarray(mask)
-        mask_path = os.path.join(output_dir, "mask.jpg")
-        mask_img.save(mask_path)
-        print(f"\nМаска сохранена: {mask_path}")
-        print("-" * 90)
+        # Выбираем СЛУЧАЙНЫЙ блок из 5
+        selected_block_idx = random.randint(0, len(all_blocks) - 1)
+        selected_block = all_blocks[selected_block_idx]
         
-        # Сохраняем оригинал для сравнения
+        print(f"\n🔸 ВЫБРАН СЛУЧАЙНЫЙ БЛОК №{selected_block_idx + 1}: {selected_block}")
+        print(f"🔸 Остальные блоки будут в маске all, но без изменений")
+        
+        # Создаем ДВЕ маски
+        mask_all, mask_real = self.create_masks(img_array.shape, all_blocks, selected_block)
+        
+        # Сохраняем маски
+        mask_all_path = os.path.join(output_dir, "mask_all.jpg")
+        mask_real_path = os.path.join(output_dir, "mask_real.jpg")
+        
+        Image.fromarray(mask_all).save(mask_all_path)
+        Image.fromarray(mask_real).save(mask_real_path)
+        
+        print(f"\n✅ Маска со ВСЕМИ блоками: {mask_all_path}")
+        print(f"✅ Маска с РЕАЛЬНЫМ блоком: {mask_real_path}")
+        
+        # Сохраняем оригинал
         original_path = os.path.join(output_dir, "original.jpg")
         img.save(original_path)
+        
+        # Сохраняем информацию о выбранном блоке в текстовый файл
+        info_path = os.path.join(output_dir, "selected_block_info.txt")
+        with open(info_path, 'w', encoding='utf-8') as f:
+            f.write(f"Selected block index: {selected_block_idx + 1}\n")
+            f.write(f"Selected block coordinates: {selected_block}\n")
+            f.write(f"All blocks: {all_blocks}\n")
         
         results = {}
         
         # Для каждого уровня битности (1-8)
         for n_bits in range(1, 9):
             print(f"\n{'='*70}")
-            print(f"УРОВЕНЬ {n_bits} БИТ НА ПИКСЕЛЬ - ПОЛНОЕ ЗАПОЛНЕНИЕ")
+            print(f"УРОВЕНЬ {n_bits} БИТ НА ПИКСЕЛЬ")
             print(f"{'='*70}")
             
             try:
-                capacity = self.capacities[n_bits]
-                print(f"Вместимость: {capacity['total_chars']} символов, {capacity['total_bits']} бит")
+                capacity = self.calculate_block_capacity(n_bits)
+                print(f"Вместимость одного блока: {capacity['total_chars']} символов, {capacity['total_bits']} бит")
                 
-                # Встраиваем сообщение с ПОЛНЫМ заполнением
-                embedded_array = self.embed_message_nbits_full(
-                    img_array.copy(), message, selected_blocks, n_bits
+                # Встраиваем ТОЛЬКО в выбранный случайный блок
+                embedded_array = self.embed_in_single_block(
+                    img_array.copy(), 
+                    message, 
+                    selected_block, 
+                    n_bits,
+                    fill_entire_block=fill_entire_block
                 )
                 
                 # Сохраняем изображение
-                output_filename = f"embedded_{n_bits}bits_full.jpg"
+                fill_type = "full" if fill_entire_block else "message_only"
+                output_filename = f"embedded_{n_bits}bits_{fill_type}.jpg"
                 output_path = os.path.join(output_dir, output_filename)
                 
                 embedded_img = Image.fromarray(embedded_array)
                 embedded_img.save(output_path)
                 
-                # Извлекаем ВСЕ биты для проверки
-                extracted_message_bits, all_extracted_bits = self.extract_message_nbits_full(
-                    embedded_array, selected_blocks, n_bits
+                # Извлекаем из выбранного блока для проверки
+                extracted_message_bits, all_extracted = self.extract_from_single_block(
+                    embedded_array, 
+                    selected_block, 
+                    n_bits,
+                    extract_full_block=fill_entire_block
                 )
                 extracted_message = self.bits_to_text(extracted_message_bits)
                 
-                # Подсчитываем изменения
-                changes = 0
-                for bx, by in selected_blocks:
+                # Проверяем изменения в разных блоках
+                changes_in_selected = 0
+                changes_in_others = 0
+                
+                for i, (bx, by) in enumerate(all_blocks):
+                    block_changes = 0
                     for y in range(by, by + self.block_size):
                         for x in range(bx, bx + self.block_size):
                             if not np.array_equal(img_array[y, x], embedded_array[y, x]):
-                                changes += 1
+                                block_changes += 1
+                    
+                    if i == selected_block_idx:
+                        changes_in_selected = block_changes
+                    else:
+                        changes_in_others += block_changes
                 
                 results[n_bits] = {
                     'path': output_path,
+                    'selected_block': selected_block_idx + 1,
                     'extracted': extracted_message,
                     'correct': extracted_message == message,
-                    'changed_pixels': changes,
-                    'total_pixels': self.total_pixels,
-                    'total_bits': capacity['total_bits'],
-                    'extracted_bits_count': len(all_extracted_bits)
+                    'changes_in_selected': changes_in_selected,
+                    'changes_in_others': changes_in_others,
+                    'capacity': capacity
                 }
                 
                 print(f"\n  РЕЗУЛЬТАТ:")
                 print(f"  Сохранено: {output_path}")
-                print(f"  Изменено пикселей: {changes} из {self.total_pixels}")
-                print(f"  Изменено в %: {changes/self.total_pixels*100:.1f}%")
-                print(f"  Извлечено бит всего: {len(all_extracted_bits)}")
-                print(f"  Извлечено сообщение: '{extracted_message}'")
+                print(f"  Изменено в ВЫБРАННОМ блоке {selected_block_idx + 1}: {changes_in_selected} пикселей")
+                print(f"  Изменено в ДРУГИХ блоках: {changes_in_others} пикселей")
+                print(f"  Извлечено: '{extracted_message}'")
                 print(f"  Корректно: {extracted_message == message}")
                 
             except Exception as e:
@@ -349,30 +376,32 @@ class SteganographyMultiLevel:
                 results[n_bits] = {'error': str(e)}
         
         # Сохраняем отчет
-        self.save_report_full(results, message, selected_blocks, output_dir)
+        self.save_report(results, message, all_blocks, selected_block_idx, output_dir)
         
-        return results, selected_blocks, mask
+        return results, all_blocks, selected_block_idx, (mask_all, mask_real)
     
-    def save_report_full(self, results, original_message, selected_blocks, output_dir):
-        """Сохранение подробного отчета о ПОЛНОМ заполнении"""
-        report_path = os.path.join(output_dir, "report_full.txt")
+    def save_report(self, results, original_message, all_blocks, selected_idx, output_dir):
+        """Сохранение отчета с информацией о двух масках"""
+        report_path = os.path.join(output_dir, "report.txt")
         
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write("=" * 90 + "\n")
-            f.write("ОТЧЕТ О ПОЛНОМ ЗАПОЛНЕНИИ 5 БЛОКОВ 32x32\n")
+            f.write("ОТЧЕТ: СЛУЧАЙНЫЙ БЛОК ИЗ 5 (ДВЕ МАСКИ)\n")
             f.write("=" * 90 + "\n\n")
             
             f.write(f"Исходное сообщение: '{original_message}'\n")
             f.write(f"Длина: {len(original_message)} символов = {len(original_message) * 8} бит\n\n")
             
-            f.write("Блоки 32x32:\n")
-            for i, (x, y) in enumerate(selected_blocks, 1):
-                f.write(f"  Блок {i}: ({x}, {y})\n")
+            f.write("Все 5 блоков с максимальной энтропией:\n")
+            for i, (x, y) in enumerate(all_blocks, 1):
+                marker = "🔸 РЕАЛЬНЫЙ" if i-1 == selected_idx else "  "
+                f.write(f"  {marker} Блок {i}: ({x}, {y})\n")
             
-            f.write(f"\nВсего пикселей в 5 блоках: {self.total_pixels}\n")
-            f.write(f"Всего каналов (RGB): {self.total_pixels * 3}\n\n")
+            f.write(f"\nСохраненные маски:\n")
+            f.write(f"  - mask_all.jpg: все 5 блоков белые (для запутывания)\n")
+            f.write(f"  - mask_real.jpg: только блок {selected_idx + 1} белый (реальный)\n\n")
             
-            f.write("РЕЗУЛЬТАТЫ ПО УРОВНЯМ (ПОЛНОЕ ЗАПОЛНЕНИЕ):\n")
+            f.write("РЕЗУЛЬТАТЫ ПО УРОВНЯМ:\n")
             f.write("-" * 90 + "\n")
             
             for n_bits in range(1, 9):
@@ -382,24 +411,51 @@ class SteganographyMultiLevel:
                     if 'error' in results[n_bits]:
                         f.write(f"  Статус: ОШИБКА - {results[n_bits]['error']}\n")
                     else:
-                        cap = self.capacities[n_bits]
-                        f.write(f"  Вместимость: {cap['total_chars']} символов, {cap['total_bits']} бит\n")
-                        f.write(f"  Фактически встроено бит: {cap['total_bits']} (ПОЛНОЕ ЗАПОЛНЕНИЕ)\n")
-                        f.write(f"  Изменено пикселей: {results[n_bits]['changed_pixels']} из {self.total_pixels}\n")
-                        f.write(f"  Изменено в %: {results[n_bits]['changed_pixels']/self.total_pixels*100:.1f}%\n")
-                        f.write(f"  Извлечено бит при проверке: {results[n_bits]['extracted_bits_count']}\n")
-                        f.write(f"  Извлечено сообщение: '{results[n_bits]['extracted']}'\n")
-                        f.write(f"  Корректность: {results[n_bits]['correct']}\n")
+                        cap = results[n_bits]['capacity']
+                        f.write(f"  Файл: {os.path.basename(results[n_bits]['path'])}\n")
+                        f.write(f"  Вместимость блока: {cap['total_chars']} символов, {cap['total_bits']} бит\n")
+                        f.write(f"  Изменено в реальном блоке: {results[n_bits]['changes_in_selected']} пикселей\n")
+                        f.write(f"  Изменено в других блоках: {results[n_bits]['changes_in_others']} пикселей\n")
+                        f.write(f"  Извлечено: '{results[n_bits]['extracted']}'\n")
+                        f.write(f"  Корректно: {results[n_bits]['correct']}\n")
                 else:
                     f.write(f"  Нет данных\n")
         
-        print(f"\nПодробный отчет сохранен: {report_path}")
+        print(f"\n📄 Отчет сохранен: {report_path}")
 
-def demonstrate_full_fill():
-    """Демонстрация ПОЛНОГО заполнения всех 5 блоков"""
+def visualize_masks(image_shape, all_blocks, real_block, output_dir):
+    """Визуализация двух масок для наглядности"""
+    
+    # Создаем цветную визуализацию
+    vis = np.zeros((image_shape[0], image_shape[1], 3), dtype=np.uint8)
+    
+    # Рисуем все блоки серым
+    for x, y in all_blocks:
+        vis[y:y+32, x:x+32] = [100, 100, 100]
+    
+    # Рисуем реальный блок красным
+    x, y = real_block
+    vis[y:y+32, x:x+32] = [255, 0, 0]
+    
+    # Добавляем границы блоков
+    for x, y in all_blocks:
+        # Горизонтальные линии
+        vis[y:y+32, x:x+2] = [255, 255, 255]
+        vis[y:y+2, x:x+32] = [255, 255, 255]
+        vis[y+30:y+32, x:x+32] = [255, 255, 255]
+        vis[y:y+32, x+30:x+32] = [255, 255, 255]
+    
+    vis_path = os.path.join(output_dir, "blocks_visualization.jpg")
+    Image.fromarray(vis).save(vis_path)
+    print(f"🎨 Визуализация блоков: {vis_path}")
+    print(f"   - Серые блоки: все 5 кандидатов")
+    print(f"   - Красный блок: реальный с информацией")
+
+def demonstrate_random_block():
+    """Демонстрация случайного выбора блока с двумя масками"""
     
     # Создаем экземпляр класса
-    stego = SteganographyMultiLevel(block_size=32, num_blocks=5)
+    stego = SteganographyRandomBlock(block_size=32, num_blocks=5)
     
     # Тестовое сообщение
     message = "Secret Message"
@@ -408,30 +464,34 @@ def demonstrate_full_fill():
     input_image = "container.jpg"  # Замените на ваш файл
     
     try:
-        # Запускаем обработку с ПОЛНЫМ заполнением
-        results, blocks, mask = stego.process_all_levels_full(
+        # Запускаем обработку
+        results, all_blocks, selected_idx, masks = stego.process_random_block(
             image_path=input_image,
             message=message,
-            output_dir="stego_full_fill"
+            output_dir="stego_dual_masks",
+            fill_entire_block=True,
+            seed=42  # для воспроизводимости
         )
         
-        # Итоговая статистика
-        print("\n" + "=" * 90)
-        print("ИТОГОВАЯ СТАТИСТИКА ПОЛНОГО ЗАПОЛНЕНИЯ")
-        print("=" * 90)
+        mask_all, mask_real = masks
         
-        for n_bits in range(1, 9):
-            if n_bits in results and 'error' not in results[n_bits]:
-                cap = stego.capacities[n_bits]
-                print(f"\n{n_bits} бит/пиксель:")
-                print(f"  Вместимость: {cap['total_chars']} символов")
-                print(f"  Встроено бит: {cap['total_bits']} ({cap['total_bits']/8} байт)")
-                print(f"  Изменено пикселей: {results[n_bits]['changed_pixels']}")
-                print(f"  Сообщение извлечено: '{results[n_bits]['extracted']}'")
-                print(f"  Корректно: {results[n_bits]['correct']}")
+        # Создаем визуализацию
+        img = Image.open(input_image).convert('RGB')
+        visualize_masks(np.array(img).shape, all_blocks, all_blocks[selected_idx], "stego_dual_masks")
+        
+        print("\n" + "=" * 90)
+        print("ИТОГОВАЯ ИНФОРМАЦИЯ:")
+        print("=" * 90)
+        print(f"✅ Всего создано файлов в директории 'stego_dual_masks':")
+        print(f"   - mask_all.jpg: все 5 блоков белые")
+        print(f"   - mask_real.jpg: только блок {selected_idx + 1} белый")
+        print(f"   - blocks_visualization.jpg: серый - все блоки, красный - реальный")
+        print(f"   - embedded_1bits_full.jpg ... embedded_8bits_full.jpg: изображения с информацией")
+        print(f"   - report.txt: подробный отчет")
+        print(f"   - selected_block_info.txt: информация о выбранном блоке")
         
     except Exception as e:
         print(f"Ошибка: {e}")
 
 if __name__ == "__main__":
-    demonstrate_full_fill()
+    demonstrate_random_block()
